@@ -378,11 +378,9 @@ class SyncEngine:
 
     def _server_loop(self) -> None:
         """TCP server that accepts connections from paired devices."""
-        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server_socket.bind(("0.0.0.0", DEFAULT_PORT))
-        self._server_socket.listen(10)
-        self._server_socket.settimeout(1.0)
+        if not self._server_socket:
+            logger.error("Server socket not initialized")
+            return
 
         logger.info(f"Sync server listening on port {DEFAULT_PORT}")
 
@@ -408,9 +406,16 @@ class SyncEngine:
         if self._running:
             return
 
+        # Bind TCP socket synchronously so errors propagate immediately
+        self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server_socket.bind(("0.0.0.0", DEFAULT_PORT))
+        self._server_socket.listen(10)
+        self._server_socket.settimeout(1.0)
+
         self._running = True
 
-        # Start TCP server
+        # Start TCP server accept loop
         self._server_thread = threading.Thread(
             target=self._server_loop,
             daemon=True,

@@ -226,6 +226,16 @@ class DeviceDiscovery:
             socket.SO_REUSEADDR,
             1
         )
+        # Allow multiple processes to bind (macOS/Linux)
+        if hasattr(socket, 'SO_REUSEPORT'):
+            try:
+                self._listen_socket.setsockopt(
+                    socket.SOL_SOCKET,
+                    socket.SO_REUSEPORT,
+                    1
+                )
+            except OSError:
+                pass
         self._listen_socket.bind(
             ("0.0.0.0", self.broadcast_port)
         )

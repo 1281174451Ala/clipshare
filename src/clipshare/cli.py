@@ -11,6 +11,12 @@ def cmd_start(args: argparse.Namespace) -> None:
     daemon.start()
 
 
+def cmd_daemon(args: argparse.Namespace) -> None:
+    """Run daemon in foreground (internal command)."""
+    daemon = Daemon()
+    daemon.run_daemon()
+
+
 def cmd_list(args: argparse.Namespace) -> None:
     daemon = Daemon()
     daemon.list_devices()
@@ -37,6 +43,12 @@ def cmd_status(args: argparse.Namespace) -> None:
 
 
 def main() -> None:
+    # Handle --daemon flag first (internal use)
+    if "--daemon" in sys.argv:
+        daemon = Daemon()
+        daemon.run_daemon()
+        return
+
     parser = argparse.ArgumentParser(
         prog="clipshare",
         description="LAN Clipboard Sync Tool - share clipboard across Windows and macOS",

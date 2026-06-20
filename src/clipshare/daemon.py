@@ -26,8 +26,20 @@ from .sync import SyncEngine
 
 logger = logging.getLogger(__name__)
 
-# PID file for daemon management
-PID_FILE = os.path.join(os.path.expanduser("~"), ".clipshare", "clipshare.pid")
+
+def _get_pid_file() -> str:
+    """Get PID file path, using config directory with fallback."""
+    home_pid = os.path.join(os.path.expanduser("~"), ".clipshare", "clipshare.pid")
+    try:
+        os.makedirs(os.path.dirname(home_pid), exist_ok=True)
+        # Test if writable
+        test_file = os.path.join(os.path.dirname(home_pid), ".test_write")
+        with open(test_file, "w") as f:
+            f.write("test")
+        os.remove(test_file)
+        return home_pid
+    except OSError:
+        return os.path.join(os.getcwd(), "clipshare.pid")
 
 
 class Daemon:
@@ -74,14 +86,11 @@ class Daemon:
         return base64.b64encode(public_key_int.to_bytes(256, "big")).decode("utf-8")
 
     def start(self) -> None:
-        """Start all services."""
-        if self._running:
-            print("Clipshare is already running.")
-            return
-
+        """Start all services in background."""
+        pid_file = _get_pid_file()
         # Check if already running
-        if os.path.exists(PID_FILE):
-            with open(PID_FILE, "r") as f:
+        if os.path.exists(pid_file):
+            with open(pid_file, "r") as f:
                 old_pid = f.read().strip()
             try:
                 old_pid_int = int(old_pid)
@@ -89,22 +98,78 @@ class Daemon:
                 print(f"Clipshare is already running (PID: {old_pid})")
                 return
             except (OSError, ValueError):
-                # Stale PID file
-                os.remove(PID_FILE)
+                try:
+                    os.remove(pid_file)
+                except OSError:
+                    pass
 
+        # Start as background subprocess
+        import subprocess
+
+        # Build command for daemon mode
+        if getattr(sys, 'frozen', False):
+            # PyInstaller binary
+            cmd = [sys.executable, "--daemon"]
+        else:
+            # Running from source
+            cmd = [sys.executable, "-m", "clipshare", "--daemon"]
+
+        # Start the daemon process
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            stdin=subprocess.DEVNULL,
+        )
+
+        # Wait briefly and check if it's still running
+        time.sleep(1)
+
+        if proc.poll() is not None:
+            # Process exited immediately - read error
+            stderr = proc.stderr.read().decode("utf-8", errors="replace").strip()
+            if stderr:
+                print(f"Failed to start: {stderr}")
+            else:
+                print("Failed to start daemon process.")
+            return
+
+        # Write PID file
+        pid_file = _get_pid_file()
+        try:
+            os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+            with open(pid_file, "w") as f:
+                f.write(str(proc.pid))
+        except OSError:
+            pass
+
+        print(f"Clipshare started in background (device: {self.config.get_device_name()})")
+        print(f"Listening on port {DEFAULT_PORT}")
+        print(f"PID: {proc.pid}")
+
+    def run_daemon(self) -> None:
+        """Run the daemon in foreground (called when --daemon flag is passed)."""
         self._running = True
 
         # Write PID file
-        os.makedirs(os.path.dirname(PID_FILE), exist_ok=True)
-        with open(PID_FILE, "w") as f:
-            f.write(str(os.getpid()))
+        pid_file = _get_pid_file()
+        try:
+            os.makedirs(os.path.dirname(pid_file), exist_ok=True)
+            with open(pid_file, "w") as f:
+                f.write(str(os.getpid()))
+        except OSError:
+            pass
 
-        self.discovery.start()
-        self.sync.start()
-
-        print(f"Clipshare started (device: {self.config.get_device_name()})")
-        print(f"Listening on port {DEFAULT_PORT}")
-        print(f"PID: {os.getpid()}")
+        try:
+            self.discovery.start()
+            self.sync.start()
+        except OSError as e:
+            print(f"Failed to start: {e}", file=sys.stderr)
+            try:
+                os.remove(pid_file)
+            except OSError:
+                pass
+            sys.exit(1)
 
         # Keep running
         try:
@@ -123,21 +188,41 @@ class Daemon:
         self.discovery.stop()
 
         # Remove PID file
-        if os.path.exists(PID_FILE):
-            os.remove(PID_FILE)
+        pid_file = _get_pid_file()
+        if os.path.exists(pid_file):
+            try:
+                os.remove(pid_file)
+            except OSError:
+                pass
 
         print("Clipshare stopped.")
 
     def list_devices(self) -> None:
         """List all discovered devices."""
-        # Send a quick status request to the daemon if running
+        # Start a quick discovery scan
+        print("Scanning for devices...")
+        try:
+            self.discovery.start()
+            time.sleep(3)  # Wait for broadcasts
+        except OSError:
+            # Port already in use - daemon may be running
+            pass
         devices = self.discovery.get_devices()
+        try:
+            self.discovery.stop()
+        except Exception:
+            pass
 
         if not devices:
             print("No devices found on the network.")
+            print("\nTroubleshooting:")
+            print("  1. Ensure clipshare is running on the other device")
+            print("  2. Check both devices are on the same WiFi/network")
+            print("  3. Check firewall allows UDP port 19206 and TCP port 19205")
+            print("  4. Some routers block broadcast - try disabling AP isolation")
             return
 
-        print(f"{'Device Name':<20} {'IP Address':<18} {'Status':<12}")
+        print(f"\n{'Device Name':<20} {'IP Address':<18} {'Status':<12}")
         print("-" * 50)
 
         paired = self.config.get_paired_devices()
@@ -147,9 +232,22 @@ class Daemon:
 
     def pair(self, device_name: str) -> None:
         """Pair with a device by name."""
+        # Quick scan first
+        print("Scanning for devices...")
+        try:
+            self.discovery.start()
+            time.sleep(3)
+        except OSError:
+            pass
         device = self.discovery.get_device_by_name(device_name)
+        try:
+            self.discovery.stop()
+        except Exception:
+            pass
+
         if not device:
             print(f"Device '{device_name}' not found online.")
+            print("Run 'clipshare list' to see available devices.")
             return
 
         if self.config.is_paired(device.device_id):
@@ -226,12 +324,14 @@ class Daemon:
 
     def status(self) -> None:
         """Show daemon status."""
+        pid_file = _get_pid_file()
         is_running = False
-        if os.path.exists(PID_FILE):
-            with open(PID_FILE, "r") as f:
-                old_pid = f.read().strip()
+        pid = ""
+        if os.path.exists(pid_file):
+            with open(pid_file, "r") as f:
+                pid = f.read().strip()
             try:
-                os.kill(int(old_pid), 0)
+                os.kill(int(pid), 0)
                 is_running = True
             except (OSError, ValueError):
                 pass
@@ -239,8 +339,7 @@ class Daemon:
         print(f"Device Name: {self.config.get_device_name()}")
         print(f"Status: {'Running' if is_running else 'Stopped'}")
         if is_running:
-            with open(PID_FILE, "r") as f:
-                print(f"PID: {f.read().strip()}")
+            print(f"PID: {pid}")
 
         paired = self.config.get_paired_devices()
         print(f"Paired Devices: {len(paired)}")
@@ -249,11 +348,12 @@ class Daemon:
 
     def stop_daemon(self) -> None:
         """Stop the daemon process by PID file."""
-        if not os.path.exists(PID_FILE):
+        pid_file = _get_pid_file()
+        if not os.path.exists(pid_file):
             print("No running Clipshare daemon found.")
             return
 
-        with open(PID_FILE, "r") as f:
+        with open(pid_file, "r") as f:
             pid = f.read().strip()
 
         try:
@@ -262,9 +362,14 @@ class Daemon:
             print(f"Sent stop signal to Clipshare daemon (PID: {pid})")
         except ProcessLookupError:
             print("Daemon not running. Cleaning up PID file.")
-            os.remove(PID_FILE)
         except Exception as e:
             print(f"Failed to stop daemon: {e}")
+
+        # Clean up PID file
+        try:
+            os.remove(pid_file)
+        except OSError:
+            pass
 
     def handle_pairing_request(self, sock: socket.socket) -> None:
         """Handle incoming pairing request (called from sync engine)."""
